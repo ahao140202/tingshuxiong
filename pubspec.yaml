@@ -1,0 +1,36 @@
+name: tingshuxiong
+description: "听书熊：AI 有声小说生成器（DeepSeek 口语化改写 + 讯飞 TTS 合成）"
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.13.1
+
+dependencies:
+  audioplayers: ^6.8.1
+  crypto: ^3.0.7
+  dio: ^5.11.0
+  fast_gbk: ^1.0.0
+  file_selector: ^1.1.0
+  flutter:
+    sdk: flutter
+  path: ^1.9.1
+  path_provider: ^2.1.6
+  sqflite: ^2.4.3
+  sqflite_common_ffi: ^2.4.2+1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+
+# sqlite3 包的构建钩子：使用系统自带的 SQLite（Windows 10+ 的 winsqlite3.dll），
+# 避免构建时从 GitHub 下载预编译库（网络不可达时构建失败）。
+hooks:
+  user_defines:
+    sqlite3:
+      source: system
+      name_windows: winsqlite3
