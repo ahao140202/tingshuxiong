@@ -1,5 +1,5 @@
 name: tingshuxiong
-description: "听书熊：AI 有声小说生成器（DeepSeek 口语化改写 + 讯飞 TTS 合成）"
+description: "听书熊：AI 有声小说生成器（DeepSeek 修订润色 + 讯飞 TTS 合成）"
 publish_to: 'none'
 version: 0.1.0+1
 

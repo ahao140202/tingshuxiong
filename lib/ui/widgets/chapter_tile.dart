@@ -116,7 +116,7 @@ class ChapterTile extends StatelessWidget {
       case ChapterStatus.notGenerated:
         return '未生成';
       case ChapterStatus.rewriting:
-        return 'AI 口语化改写中…';
+        return 'AI 修订润色中…';
       case ChapterStatus.synthesizing:
         return '音频合成中…';
       case ChapterStatus.generated:

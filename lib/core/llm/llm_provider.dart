@@ -22,7 +22,7 @@ abstract class LLMProvider {
   /// 当前使用的模型名。
   String get model;
 
-  /// 将章节原文改写为适合语音朗读的口语化文本。
+  /// 将章节原文修订润色为适合语音朗读的文本。
   ///
   /// [title] 章节标题，[rawText] 章节原文；
   /// [maxTokens] 与 [temperature] 缺省时使用引擎默认值（1500 / 0.7）。

@@ -333,7 +333,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _sectionTitle('说明'),
           Text(
             '凭据仅保存在本机应用数据目录。生成流程：'
-            'LLM 口语化改写 → 所选 TTS 合成 → 本地存储。',
+            'LLM 修订润色 → 所选 TTS 合成 → 本地存储。',
             style: Theme.of(context).textTheme.bodySmall,
           ),
         ],

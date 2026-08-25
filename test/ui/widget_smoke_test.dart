@@ -210,7 +210,7 @@ void main() {
       expect(find.text('未生成'), findsOneWidget);
 
       await tester.pumpWidget(wrap(makeChapter(ChapterStatus.rewriting)));
-      expect(find.text('AI 口语化改写中…'), findsOneWidget);
+      expect(find.text('AI 修订润色中…'), findsOneWidget);
       expect(find.byType(CircularProgressIndicator), findsOneWidget);
 
       await tester.pumpWidget(wrap(makeChapter(ChapterStatus.synthesizing)));
