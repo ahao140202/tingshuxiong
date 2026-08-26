@@ -1,13 +1,21 @@
 /// 凭据字段描述：设置页按此渲染输入框，注册表按此从凭据映射取值。
 ///
 /// [key] 为凭据映射中的键名（如 `apiKey` / `appId`）；
-/// [label] 为设置页显示名（如 `API Key`）；[obscure] 控制是否密码框。
+/// [label] 为设置页显示名（如 `API Key`）；[obscure] 控制是否密码框；
+/// [optional] 标记可选填字段（不参与「凭据齐全」校验，如腾讯云 AppId
+/// 仅超自然音色需要，缺省不影响普通音色合成）。
 class CredentialField {
-  const CredentialField(this.key, this.label, {this.obscure = false});
+  const CredentialField(
+    this.key,
+    this.label, {
+    this.obscure = false,
+    this.optional = false,
+  });
 
   final String key;
   final String label;
   final bool obscure;
+  final bool optional;
 }
 
 /// LLM 提供商类型。
@@ -43,6 +51,17 @@ enum TTSKind {
       CredentialField('appId', 'APPID'),
       CredentialField('apiKey', 'API Key', obscure: true),
       CredentialField('apiSecret', 'API Secret', obscure: true),
+    ],
+  ),
+  tencent(
+    '腾讯云',
+    '101001',
+    [
+      // SecretId 与 SecretKey 同为敏感凭据，均按密文框处理（掩码展示）。
+      CredentialField('secretId', 'SecretId', obscure: true),
+      CredentialField('secretKey', 'SecretKey', obscure: true),
+      // AppId 仅超自然大模型音色（实时合成）需要，普通音色无需填写。
+      CredentialField('appId', 'AppId', optional: true),
     ],
   );
 

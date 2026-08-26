@@ -13,7 +13,7 @@ import 'package:tingshuxiong/platform/platform.dart';
 ///
 /// - [failures]：前 N 次调用抛 [LLMException]；
 /// - [failOnCalls]：指定调用序号失败（与 [failures] 叠加），
-///   用于精确制造「某章失败、其余成功」的场景（如继续生成测试）；
+///   用于精确制造「某章失败、其余成功」的场景（如离线缓存续跑测试）；
 /// - [gate]：非空时每次调用等待 gate 完成（模拟进行中的改写请求）。
 class FakeLLM implements LLMProvider {
   FakeLLM({this.failures = 0, this.gate, this.failOnCalls = const {}});
@@ -114,6 +114,49 @@ class FakeTxtPicker implements TxtPicker {
   Future<TxtFile?> pick() async => file;
 }
 
+/// 音频导出桩：记录导出请求的书并固定返回结果（测试用）。
+///
+/// [error] 非空时 [exportBook]/[mergeBook] 抛该异常，用于模拟导出失败
+/// （UI 提示失败原因）；[mergeResult] 非空时作为聚合导出的返回结果。
+class FakeAudioExporter extends AudioExporter {
+  FakeAudioExporter(this.result, {this.error, this.mergeResult}) : super();
+
+  final AudioExportResult result;
+
+  /// 非空时导出抛出的异常（模拟磁盘/权限等失败场景）。
+  final Object? error;
+
+  /// 聚合导出返回结果（默认按 [result] 生成 1 个聚合文件）。
+  final AudioMergeResult? mergeResult;
+
+  /// 最近一次导出请求的书（断言用）。
+  Book? exportedBook;
+
+  /// 最近一次聚合导出请求的书（断言用）。
+  Book? mergedBook;
+
+  @override
+  Future<AudioExportResult> exportBook(Book book) async {
+    exportedBook = book;
+    final e = error;
+    if (e != null) throw e;
+    return result;
+  }
+
+  @override
+  Future<AudioMergeResult> mergeBook(Book book, {int maxSizeMb = 100}) async {
+    mergedBook = book;
+    final e = error;
+    if (e != null) throw e;
+    return mergeResult ??
+        AudioMergeResult(
+          filePaths: ['/tmp/merge/${book.title}_聚合_001_第1-1章.mp3'],
+          mergedCount: result.exported,
+          targetDir: '/tmp/merge',
+        );
+  }
+}
+
 /// 音频播放桩：记录调用并发射状态事件（模拟真实播放器行为）。
 class FakeAudio implements AudioPlayback {
   final StreamController<PlayerState> _state =
@@ -130,6 +173,12 @@ class FakeAudio implements AudioPlayback {
   int resumeCalls = 0;
   int stopCalls = 0;
   int seekCalls = 0;
+
+  /// 最近一次 seek 的目标位置（断言用）。
+  Duration? lastSeekPosition;
+
+  /// 置为 true 时 seek 抛异常（模拟播放器底层故障）。
+  bool failSeek = false;
 
   bool _playing = false;
 
@@ -179,10 +228,17 @@ class FakeAudio implements AudioPlayback {
   @override
   Future<void> seek(Duration position) async {
     seekCalls++;
+    lastSeekPosition = position;
+    if (failSeek) throw StateError('模拟 seek 失败');
+    // 模拟真实播放器：seek 成功后立即上报新位置。
+    _position.add(position);
   }
 
   /// 模拟播放位置更新（测试用）。
   void emitPosition(Duration position) => _position.add(position);
+
+  /// 模拟音频总时长上报（测试用）。
+  void emitDuration(Duration duration) => _duration.add(duration);
 
   /// 模拟播放完成（自动连播测试用）。
   void emitComplete() => _complete.add(null);

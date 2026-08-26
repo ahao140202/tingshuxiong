@@ -76,46 +76,48 @@ void main() {
       expect(defaultPath, startsWith(tempDir.path));
     });
 
-    test('moveToHistory 把旧文件转移到历史目录并带时间戳', () async {
+    test('deleteChapterFiles 删除章节旧生成文件（存在则删）', () async {
       final store = AudioStore(rootProvider: () async => tempDir);
       final audio = await store.saveAudio('book', 2, Uint8List.fromList([1]));
       final rewrite = await store.saveRewrite('book', 2, '旧改写稿');
+      expect(File(audio).existsSync(), isTrue);
+      expect(File(rewrite).existsSync(), isTrue);
 
-      final moved = await store.moveToHistory(
-        'book',
-        2,
-        audioPath: audio,
-        rewritePath: rewrite,
-      );
+      await store.deleteChapterFiles(audioPath: audio, rewritePath: rewrite);
 
       expect(File(audio).existsSync(), isFalse);
       expect(File(rewrite).existsSync(), isFalse);
-      expect(moved.audioPath, isNotNull);
-      expect(moved.rewritePath, isNotNull);
-      // 历史目录：<root>/book/history/2-<时间戳>.mp3
+      // 旧版不保留：不创建 history 目录。
       expect(
-        moved.audioPath,
-        matches(RegExp(r'history[\\/]2-\d{14}\.mp3$')),
+        Directory('${tempDir.path}$sep${p.join('book', 'history')}').existsSync(),
+        isFalse,
       );
-      expect(
-        moved.rewritePath,
-        matches(RegExp(r'history[\\/]2-\d{14}\.txt$')),
-      );
-      expect(await File(moved.audioPath!).readAsBytes(), [1]);
-      expect(await File(moved.rewritePath!).readAsString(), '旧改写稿');
     });
 
-    test('moveToHistory 源文件不存在时对应历史路径为 null', () async {
+    test('deleteBookFiles 删除整本书生成目录，目录不存在时静默', () async {
+      final store = AudioStore(rootProvider: () async => tempDir);
+      await store.saveAudio('book', 0, Uint8List.fromList([1]));
+      await store.saveRewrite('book', 0, '改写稿');
+      final bookDir = Directory('${tempDir.path}$sep${p.join('book')}');
+      expect(await bookDir.exists(), isTrue);
+
+      await store.deleteBookFiles('book');
+
+      expect(await bookDir.exists(), isFalse);
+      // 目录不存在时静默跳过，不抛错。
+      await store.deleteBookFiles('book');
+    });
+
+    test('deleteChapterFiles 源文件不存在时静默跳过', () async {
       final store = AudioStore(rootProvider: () async => tempDir);
 
-      final moved = await store.moveToHistory(
-        'book',
-        0,
+      await store.deleteChapterFiles(
         audioPath: '${tempDir.path}${sep}not-exist.mp3',
+        rewritePath: '${tempDir.path}${sep}not-exist.txt',
       );
 
-      expect(moved.audioPath, isNull);
-      expect(moved.rewritePath, isNull);
+      expect(File('${tempDir.path}${sep}not-exist.mp3').existsSync(), isFalse);
+      expect(File('${tempDir.path}${sep}not-exist.txt').existsSync(), isFalse);
     });
   });
 }

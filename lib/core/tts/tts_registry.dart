@@ -1,4 +1,5 @@
 import '../domain/domain.dart';
+import 'tencent/tencent_tts_provider.dart';
 import 'tts_provider.dart';
 import 'xunfei/xunfei_provider.dart';
 
@@ -20,6 +21,12 @@ class TTSRegistry {
           appId: credentials['appId'] ?? '',
           apiKey: credentials['apiKey'] ?? '',
           apiSecret: credentials['apiSecret'] ?? '',
+        );
+      case TTSKind.tencent:
+        return TencentTTSProvider(
+          secretId: credentials['secretId'] ?? '',
+          secretKey: credentials['secretKey'] ?? '',
+          appId: credentials['appId'] ?? '',
         );
     }
   }

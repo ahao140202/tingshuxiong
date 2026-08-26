@@ -6,50 +6,11 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 import '../core/domain/domain.dart';
 
-/// 生成文件快照：每次章节生成成功时记录一条，便于后续回溯
-/// （重新生成转移旧文件后，最近一条快照的路径会更新指向历史目录）。
-class SnapshotRecord {
-  const SnapshotRecord({
-    required this.id,
-    required this.bookId,
-    required this.chapterIndex,
-    required this.status,
-    required this.ttsConfigJson,
-    required this.createdAt,
-    this.audioPath,
-    this.rewritePath,
-  });
-
-  final int id;
-  final String bookId;
-  final int chapterIndex;
-  final String status;
-  final String? audioPath;
-  final String? rewritePath;
-  final String ttsConfigJson;
-  final DateTime createdAt;
-
-  factory SnapshotRecord.fromMap(Map<String, Object?> map) {
-    return SnapshotRecord(
-      id: map['id'] as int,
-      bookId: map['book_id'] as String,
-      chapterIndex: map['chapter_index'] as int,
-      status: map['status'] as String,
-      audioPath: map['audio_path'] as String?,
-      rewritePath: map['rewrite_path'] as String?,
-      ttsConfigJson: map['tts_config_json'] as String,
-      createdAt:
-          DateTime.fromMillisecondsSinceEpoch(map['created_at'] as int),
-    );
-  }
-}
-
-/// 书 / 章节状态与生成快照的 SQLite 持久化。
+/// 书 / 章节状态的 SQLite 持久化。
 ///
 /// 表结构：
 /// - `books`：书元数据与听书进度（每本书一行）；
-/// - `chapters`：章节完整状态（正文、改写稿、文件路径、错误信息）；
-/// - `snapshots`：生成文件状态快照（每次成功生成一条，时间倒序可回溯）。
+/// - `chapters`：章节完整状态（正文、改写稿、文件路径、错误信息）。
 ///
 /// 桌面端（Windows/Linux）使用 FFI 实现；移动端使用 sqflite 原生实现；
 /// 测试可注入 [factory] 使用内存库。
@@ -72,7 +33,7 @@ class BookDatabase {
     final path = await _pathProvider();
     final factory = _factory ?? _desktopFactory();
     final options = OpenDatabaseOptions(
-      version: 1,
+      version: 3,
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE books(
@@ -80,7 +41,8 @@ class BookDatabase {
             title TEXT NOT NULL,
             last_chapter_index INTEGER NOT NULL DEFAULT 0,
             last_position_ms INTEGER NOT NULL DEFAULT 0,
-            updated_at INTEGER NOT NULL
+            updated_at INTEGER NOT NULL,
+            created_at INTEGER NOT NULL
           )
         ''');
         await db.execute('''
@@ -97,21 +59,22 @@ class BookDatabase {
             PRIMARY KEY (book_id, chapter_index)
           )
         ''');
-        await db.execute('''
-          CREATE TABLE snapshots(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            book_id TEXT NOT NULL,
-            chapter_index INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            audio_path TEXT,
-            rewrite_path TEXT,
-            tts_config_json TEXT NOT NULL,
-            created_at INTEGER NOT NULL
-          )
-        ''');
-        await db.execute(
-          'CREATE INDEX idx_snapshots_book ON snapshots(book_id, chapter_index)',
-        );
+      },
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          // 老库补 created_at（导入时间）：先用 0 占位，再以现有
+          // updated_at 回填（历史书的导入时间无从考证，取近似值）。
+          await db.execute(
+            'ALTER TABLE books ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0',
+          );
+          await db.execute(
+            'UPDATE books SET created_at = updated_at WHERE created_at = 0',
+          );
+        }
+        if (oldVersion < 3) {
+          // v3 废弃历史生成功能：删除 snapshots 快照表（不再记录生成历史）。
+          await db.execute('DROP TABLE IF EXISTS snapshots');
+        }
       },
     );
     _db = factory != null
@@ -129,10 +92,22 @@ class BookDatabase {
   }
 
   /// 保存整本书（书元数据 + 全部章节），事务内 upsert。
+  ///
+  /// [created_at]（导入时间）只在首次插入时写入：重复保存（生成/进度
+  /// 更新）不刷新它，保证书架排序稳定。
   Future<void> saveBook(Book book) async {
     final db = _db;
     if (db == null) return;
     await db.transaction((txn) async {
+      final rows = await txn.query(
+        'books',
+        columns: ['created_at'],
+        where: 'id = ?',
+        whereArgs: [book.id],
+      );
+      final createdAt = rows.isEmpty
+          ? DateTime.now().millisecondsSinceEpoch
+          : rows.first['created_at'] as int;
       await txn.insert(
         'books',
         {
@@ -141,6 +116,7 @@ class BookDatabase {
           'last_chapter_index': book.lastChapterIndex,
           'last_position_ms': book.lastPosition.inMilliseconds,
           'updated_at': DateTime.now().millisecondsSinceEpoch,
+          'created_at': createdAt,
         },
         conflictAlgorithm: ConflictAlgorithm.replace,
       );
@@ -185,6 +161,16 @@ class BookDatabase {
     );
   }
 
+  /// 删除书及其全部章节记录（「删除小说」用），事务内执行。
+  Future<void> deleteBook(String id) async {
+    final db = _db;
+    if (db == null) return;
+    await db.transaction((txn) async {
+      await txn.delete('chapters', where: 'book_id = ?', whereArgs: [id]);
+      await txn.delete('books', where: 'id = ?', whereArgs: [id]);
+    });
+  }
+
   /// 加载最近更新过的书（启动恢复用），无记录时返回 null。
   Future<Book?> loadLatestBook() async {
     final db = _db;
@@ -192,6 +178,17 @@ class BookDatabase {
     final rows = await db.query('books', orderBy: 'updated_at DESC', limit: 1);
     if (rows.isEmpty) return null;
     return _bookFromRows(db, rows.first);
+  }
+
+  /// 加载全部书，按导入时间倒序（书架展示用：最新导入的排最前）。
+  Future<List<Book>> loadBooks() async {
+    final db = _db;
+    if (db == null) return const [];
+    final rows = await db.query(
+      'books',
+      orderBy: 'created_at DESC, updated_at DESC',
+    );
+    return [for (final row in rows) await _bookFromRows(db, row)];
   }
 
   /// 按 id 加载书（书架历史回溯用），无记录时返回 null。
@@ -245,76 +242,6 @@ class BookDatabase {
       lastPosition:
           Duration(milliseconds: row['last_position_ms'] as int? ?? 0),
     );
-  }
-
-  /// 记录一次成功生成的文件快照。
-  Future<void> insertSnapshot({
-    required String bookId,
-    required int chapterIndex,
-    required String status,
-    String? audioPath,
-    String? rewritePath,
-    required String ttsConfigJson,
-  }) async {
-    final db = _db;
-    if (db == null) return;
-    await db.insert('snapshots', {
-      'book_id': bookId,
-      'chapter_index': chapterIndex,
-      'status': status,
-      'audio_path': audioPath,
-      'rewrite_path': rewritePath,
-      'tts_config_json': ttsConfigJson,
-      'created_at': DateTime.now().millisecondsSinceEpoch,
-    });
-  }
-
-  /// 章节文件转移到历史目录后，更新该章最近一条快照的文件路径。
-  Future<void> updateSnapshotPaths(
-    String bookId,
-    int chapterIndex, {
-    String? audioPath,
-    String? rewritePath,
-  }) async {
-    final db = _db;
-    if (db == null) return;
-    final rows = await db.query(
-      'snapshots',
-      where: 'book_id = ? AND chapter_index = ?',
-      whereArgs: [bookId, chapterIndex],
-      orderBy: 'id DESC',
-      limit: 1,
-    );
-    if (rows.isEmpty) return;
-    await db.update(
-      'snapshots',
-      {'audio_path': audioPath, 'rewrite_path': rewritePath},
-      where: 'id = ?',
-      whereArgs: [rows.first['id']],
-    );
-  }
-
-  /// 查询某书（或某章）的生成快照，按时间倒序。
-  Future<List<SnapshotRecord>> loadSnapshots(
-    String bookId, {
-    int? chapterIndex,
-  }) async {
-    final db = _db;
-    if (db == null) return const [];
-    final rows = chapterIndex == null
-        ? await db.query(
-            'snapshots',
-            where: 'book_id = ?',
-            whereArgs: [bookId],
-            orderBy: 'id DESC',
-          )
-        : await db.query(
-            'snapshots',
-            where: 'book_id = ? AND chapter_index = ?',
-            whereArgs: [bookId, chapterIndex],
-            orderBy: 'id DESC',
-          );
-    return [for (final r in rows) SnapshotRecord.fromMap(r)];
   }
 
   /// 关闭数据库（测试清理用）。

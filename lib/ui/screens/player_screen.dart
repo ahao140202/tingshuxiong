@@ -18,6 +18,12 @@ class PlayerScreen extends StatefulWidget {
 }
 
 class _PlayerScreenState extends State<PlayerScreen> {
+  /// 拖动进度条时的本地预览位置（null 表示未拖动，跟随播放器实际位置）。
+  ///
+  /// 拖动中不调用播放器 seek：Windows 底层 Media Foundation 在高频
+  /// seek 下会崩溃，本地预览保证界面即时反馈，松手时统一跳转一次。
+  Duration? _dragPosition;
+
   @override
   Widget build(BuildContext context) {
     final appState = widget.appState;
@@ -32,17 +38,31 @@ class _PlayerScreenState extends State<PlayerScreen> {
           appBar: AppBar(
             title: Text(book.title, overflow: TextOverflow.ellipsis),
             actions: [
-              IconButton(
-                tooltip: '导出音频',
-                icon: const Icon(Icons.ios_share),
-                onPressed: () => _exportAudio(context, appState),
+              // ExcludeSemantics 规避 Flutter OverlayPortal 语义嫁接框架
+              // bug（#187198）：tooltip 悬浮/点击时触发 AXTree 更新失败日志；
+              // tooltip 提示与按钮点击不受影响。
+              ExcludeSemantics(
+                child: IconButton(
+                  tooltip: '导出音频',
+                  icon: const Icon(Icons.ios_share),
+                  onPressed: () => _exportAudio(context, appState),
+                ),
               ),
-              IconButton(
-                tooltip: '设置',
-                icon: const Icon(Icons.settings_outlined),
-                onPressed: () => Navigator.of(context).push(
-                  MaterialPageRoute(
-                    builder: (_) => SettingsScreen(appState: appState),
+              ExcludeSemantics(
+                child: IconButton(
+                  tooltip: '聚合并导出',
+                  icon: const Icon(Icons.merge_type),
+                  onPressed: () => _mergeExportAudio(context, appState),
+                ),
+              ),
+              ExcludeSemantics(
+                child: IconButton(
+                  tooltip: '设置',
+                  icon: const Icon(Icons.settings_outlined),
+                  onPressed: () => Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => SettingsScreen(appState: appState),
+                    ),
                   ),
                 ),
               ),
@@ -50,8 +70,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
           ),
           body: Column(
             children: [
-              // 上方：当前章节正文（播放时逐句高亮跟随）。
-              Expanded(flex: 3, child: _buildReader(context, appState)),
+              // 上方：当前章节正文（播放时逐句高亮跟随，拖动进度条时实时预览）。
+              Expanded(
+                flex: 3,
+                child: _buildReader(context, appState, _dragPosition),
+              ),
               const Divider(height: 1),
               // 下方：章节列表（生成状态 / 播放入口）。
               Expanded(flex: 2, child: _buildChapterList(context, book)),
@@ -72,7 +95,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         .length;
     if (generated == 0) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('还没有已生成的音频，请先「全部生成」')),
+        const SnackBar(content: Text('还没有已生成的音频，请先「离线缓存」')),
       );
       return;
     }
@@ -113,7 +136,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   /// 正文阅读面板：展示当前播放章节文本，按播放进度估算并高亮当前句。
-  Widget _buildReader(BuildContext context, AppState appState) {
+  ///
+  /// [previewPosition] 非空时（拖动进度条中）用它代替播放器位置估算，
+  /// 实现拖动时正文实时预览；松开后由 [AppState.seek] 同步真实位置。
+  Widget _buildReader(
+    BuildContext context,
+    AppState appState,
+    Duration? previewPosition,
+  ) {
     final theme = Theme.of(context);
     final book = appState.book;
     if (book == null || appState.playingIndex < 0) {
@@ -150,7 +180,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
               return StreamBuilder<Duration>(
                 stream: appState.playerDurationStream,
                 builder: (context, duration) {
-                  final current = position.data ?? Duration.zero;
+                  // 拖动进度条时优先用本地预览值，松开后回落到播放器位置。
+                  final current =
+                      previewPosition ?? position.data ?? Duration.zero;
                   final total = duration.data ?? Duration.zero;
                   final index = estimateSentenceIndex(
                     position: current,
@@ -179,9 +211,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
           chapter: chapter,
           isCurrent: isCurrent,
           isPlaying: isPlaying,
-          // 每章都有播放入口：无音频时上层先生成该章再播放，
-          // 生成失败时用 SnackBar 反馈；播放中点击可暂停。
-          onPlay: () => _playOrGenerate(context, appState, index),
+          // 每章都有播放入口：无音频时上层先生成该章再播放，生成失败时
+          // 用 SnackBar 反馈；播放中点击可暂停。
+          // 凭据不齐时未生成章节不可点（避免点击后仅弹提示）；
+          // 已生成章节本地有音频，不受凭据限制。
+          onPlay:
+              chapter.hasAudio || appState.canGenerate
+                  ? () => _playOrGenerate(context, appState, index)
+                  : null,
           onPause: isPlaying ? appState.togglePlay : null,
           onRetry: chapter.status.isRunnable
               ? () => appState.regenerateChapter(index)
@@ -233,15 +270,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
               if (hasAudio)
                 Row(
                   children: [
-                    IconButton(
-                      tooltip: appState.isPlaying ? '暂停' : '播放',
-                      icon: Icon(
-                        appState.isPlaying
-                            ? Icons.pause_circle_filled
-                            : Icons.play_circle_filled,
-                        size: 40,
+                    // ExcludeSemantics 同上：规避 tooltip 语义嫁接框架 bug。
+                    ExcludeSemantics(
+                      child: IconButton(
+                        tooltip: appState.isPlaying ? '暂停' : '播放',
+                        icon: Icon(
+                          appState.isPlaying
+                              ? Icons.pause_circle_filled
+                              : Icons.play_circle_filled,
+                          size: 40,
+                        ),
+                        onPressed: appState.togglePlay,
                       ),
-                      onPressed: appState.togglePlay,
                     ),
                     Expanded(
                       child: StreamBuilder<Duration>(
@@ -252,18 +292,38 @@ class _PlayerScreenState extends State<PlayerScreen> {
                             stream: appState.playerDurationStream,
                             builder: (context, duration) {
                               final total = duration.data ?? Duration.zero;
+                              final enabled = total != Duration.zero;
+                              // 拖动中显示本地预览值，否则跟随播放器位置。
+                              final display = _dragPosition ?? current;
                               return Slider(
-                                value: _sliderValue(current, total),
-                                max: total == Duration.zero
-                                    ? 1
-                                    : total.inMilliseconds.toDouble(),
-                                onChanged: total == Duration.zero
-                                    ? null
-                                    : (value) {
+                                value: _sliderValue(display, total),
+                                max: enabled
+                                    ? total.inMilliseconds.toDouble()
+                                    : 1,
+                                // 拖动中只更新本地预览，不调用播放器 seek：
+                                // 高频 seek 会让 Windows Media Foundation 崩溃，
+                                // 且 seek 后的位置事件会被节流吞掉导致不同步。
+                                onChangeStart: enabled
+                                    ? (_) =>
+                                        setState(() => _dragPosition = current)
+                                    : null,
+                                onChanged: enabled
+                                    ? (value) => setState(() {
+                                          _dragPosition = Duration(
+                                            milliseconds: value.toInt(),
+                                          );
+                                        })
+                                    : null,
+                                // 松手时一次性跳转：seek 内部会把目标位置
+                                // 立即同步到 UI 流，正文高亮随之更新。
+                                onChangeEnd: enabled
+                                    ? (value) {
+                                        setState(() => _dragPosition = null);
                                         appState.seek(
                                           Duration(milliseconds: value.toInt()),
                                         );
-                                      },
+                                      }
+                                    : null,
                               );
                             },
                           );
@@ -273,21 +333,23 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     StreamBuilder<Duration>(
                       stream: appState.playerPositionStream,
                       builder: (context, snapshot) {
-                        final current = snapshot.data ?? Duration.zero;
+                        final current =
+                            _dragPosition ?? snapshot.data ?? Duration.zero;
                         return Text(
                           _formatDuration(current),
                           style: theme.textTheme.bodySmall,
                         );
                       },
                     ),
-                    const SizedBox(width: 12),
+                    // 与生成行右侧留白一致，保证控制栏右缘对齐。
+                    const SizedBox(width: 16),
                   ],
                 )
               else
                 Padding(
                   padding: const EdgeInsets.all(8),
                   child: Text(
-                    '尚无音频，点击「全部生成」或直接点击章节播放',
+                    '尚无音频，点击「离线缓存」或直接点击章节播放',
                     style: theme.textTheme.bodySmall?.copyWith(
                       color: theme.colorScheme.outline,
                     ),
@@ -320,7 +382,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
             icon: const Icon(Icons.stop_circle_outlined),
             label: const Text('停止'),
           ),
-          const SizedBox(width: 8),
+          // 尾部留白与左侧对齐，保持行内对称。
+          const SizedBox(width: 16),
         ],
       );
     }
@@ -340,42 +403,39 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   ),
                 ),
         ),
+        // 离线缓存：无记录时整本生成，有记录时从最后一个已生成章节之后
+        // 继续（跳过已生成、不覆盖），不受预加载窗口限制。
         FilledButton.icon(
-          onPressed: appState.canGenerate ? appState.generate : null,
+          onPressed: appState.canGenerate
+              ? () => _generateOrContinue(context, appState)
+              : null,
           icon: const Icon(Icons.auto_awesome),
-          label: const Text('全部生成'),
+          label: const Text('离线缓存'),
         ),
         const SizedBox(width: 8),
-        // 继续生成：从第一个未完成章节（未生成/失败/已取消）继续，
-        // 已生成章节自动跳过、不覆盖已有内容。
+        // 全部清空：删除本小说全部已生成内容（仅已有生成记录时可点，
+        // 防止误触），清空后可从「离线缓存」从头再来。
         OutlinedButton.icon(
-          onPressed: appState.canGenerate
-              ? () => _continueGenerate(context, appState)
+          onPressed: _generatedCount(appState) > 0
+              ? () => _confirmClearAll(context, appState)
               : null,
-          icon: const Icon(Icons.playlist_play),
-          label: const Text('继续生成'),
+          icon: const Icon(Icons.delete_sweep_outlined),
+          label: const Text('全部清空'),
         ),
-        const SizedBox(width: 8),
-        // 重新生成：从当前定位章节起按最新配置重做，旧文件转入历史目录。
-        OutlinedButton.icon(
-          onPressed: appState.canGenerate
-              ? () => _confirmRegenerate(context, appState)
-              : null,
-          icon: const Icon(Icons.replay),
-          label: const Text('重新生成'),
-        ),
-        const SizedBox(width: 8),
+        // 尾部留白与左侧对齐，保持行内对称。
+        const SizedBox(width: 16),
       ],
     );
   }
 
-  /// 继续生成：从第一个未完成章节继续；全部已完成时给出提示。
-  Future<void> _continueGenerate(
+  /// 离线缓存入口：无记录整本生成，有记录从最后一个已生成章节之后继续；
+  /// 全部章节均已生成时给出提示。
+  Future<void> _generateOrContinue(
     BuildContext context,
     AppState appState,
   ) async {
     final messenger = ScaffoldMessenger.of(context);
-    final ok = await appState.continueGenerate();
+    final ok = await appState.generateOrContinue();
     if (!ok && context.mounted) {
       messenger.showSnackBar(
         const SnackBar(content: Text('所有章节都已生成，无需继续')),
@@ -383,23 +443,21 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
-  /// 重新生成确认：起点为当前播放/定位章节（无则第 1 章），
-  /// 确认后从该章开始重新生成（旧文件转移到历史目录，可回溯）。
-  Future<void> _confirmRegenerate(
+  /// 全部清空确认：删除本小说全部已生成音频与改写稿（不触发生成），
+  /// 章节状态重置为未生成，之后可从「离线缓存」从头再来。
+  Future<void> _confirmClearAll(
     BuildContext context,
     AppState appState,
   ) async {
     final book = appState.book;
     if (book == null) return;
-    final start = appState.playingIndex >= 0 ? appState.playingIndex : 0;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('重新生成'),
+        title: const Text('全部清空'),
         content: Text(
-          '将从「${book.chapterAt(start).title}」开始按最新配置重新生成'
-          '第 ${start + 1} 章至第 ${book.chapterCount} 章，'
-          '原有音频与改写稿将转移到历史目录（可在快照中回溯）。\n'
+          '将删除本小说全部 ${book.chapterCount} 章的已生成音频与改写稿，'
+          '章节状态重置为未生成。\n'
           '确定继续？',
         ),
         actions: [
@@ -417,16 +475,67 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (confirmed != true || !context.mounted) return;
     final messenger = ScaffoldMessenger.of(context);
     try {
-      await appState.regenerateFrom(start);
+      await appState.clearAll();
+      messenger.showSnackBar(
+        const SnackBar(content: Text('已清空全部已生成内容')),
+      );
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('清空失败：$e')));
+    }
+  }
+
+  /// 聚合并导出：按设置的大小上限（默认 100MB）把已生成章节按顺序合并
+  /// 为数量更少的大文件，超出上限自动分卷，导出到所选目录。
+  Future<void> _mergeExportAudio(
+    BuildContext context,
+    AppState appState,
+  ) async {
+    final book = appState.book;
+    if (book == null) return;
+    final generated = _generatedCount(appState);
+    if (generated == 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('还没有已生成的音频，请先「离线缓存」')),
+      );
+      return;
+    }
+    final maxSizeMb = appState.settings.mergeFileSizeMb;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('聚合并导出'),
+        content: Text(
+          '将把 $generated 个已生成章节按顺序合并为不超过 $maxSizeMb MB 的 '
+          'mp3 大文件（超出上限自动分卷），导出到所选目录。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('选择目录并导出'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !context.mounted) return;
+
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final result = await appState.mergeExportAudio();
       messenger.showSnackBar(
         SnackBar(
           content: Text(
-            '已从第 ${start + 1} 章开始重新生成，旧文件已转入历史目录',
+            '已聚合 ${result.mergedCount} 个章节 → ${result.filePaths.length} '
+            '个文件，导出到 ${result.targetDir}',
           ),
+          duration: const Duration(seconds: 5),
         ),
       );
     } catch (e) {
-      messenger.showSnackBar(SnackBar(content: Text('重新生成失败：$e')));
+      messenger.showSnackBar(SnackBar(content: Text('聚合导出失败：$e')));
     }
   }
 

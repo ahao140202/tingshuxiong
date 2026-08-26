@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/foundation.dart';
@@ -12,7 +11,6 @@ import '../../platform/platform.dart';
 ///
 /// 引擎的 bookStream 会持续把章节状态变化同步到 UI，同时：
 /// - 整书（书 + 章节状态）落 SQLite，启动时恢复上次打开的书；
-/// - 章节生成成功时写入快照表（便于后续回溯）；
 /// - 播放进度按 5 秒节流写入数据库。
 class AppState extends ChangeNotifier {
   AppState({
@@ -55,12 +53,12 @@ class AppState extends ChangeNotifier {
 
   AppSettings _settings = const AppSettings();
   Book? _book;
+
+  /// 书架上的全部书籍（按导入时间倒序，与数据库一致）。
+  List<Book> _books = [];
   bool _initialized = false;
   int _playingIndex = -1;
   bool _playing = false;
-
-  /// 章节状态跟踪（`bookId:index` → 状态），用于检测「新生成成功」插入快照。
-  final Map<String, ChapterStatus> _seenStatus = {};
 
   Duration _lastPosition = Duration.zero;
   DateTime _lastProgressSave = DateTime.fromMillisecondsSinceEpoch(0);
@@ -68,6 +66,9 @@ class AppState extends ChangeNotifier {
   AppSettings get settings => _settings;
 
   Book? get book => _book;
+
+  /// 书架书籍列表（只读视图）：最新导入的排最前。
+  List<Book> get books => List.unmodifiable(_books);
 
   bool get initialized => _initialized;
 
@@ -83,41 +84,56 @@ class AppState extends ChangeNotifier {
 
   Stream<PlayerState> get playerStateStream => _player.stateStream;
 
+  /// UI 播放位置流控制器：与节流逻辑分离，便于 seek 后强制推送位置。
+  final StreamController<Duration> _positionController =
+      StreamController<Duration>.broadcast();
+
   /// 播放位置流（UI 用，已节流）：audioplayers 约 200ms 发射一次，
   /// 节流到约 500ms，降低 UI 重建频率与 Windows 无障碍语义树更新压力。
   /// 用普通回调节流而非 async* 转换器：broadcast 源在转换器暂停时
   /// 不缓冲事件，回调模式可保证首个事件必达、后续按节流窗口放行。
   late final Stream<Duration> _positionUi = () {
-    final controller = StreamController<Duration>.broadcast();
-    var lastEmit = DateTime.fromMillisecondsSinceEpoch(0);
     _player.positionStream.listen((position) {
       final now = DateTime.now();
-      if (now.difference(lastEmit) >= const Duration(milliseconds: 500)) {
-        lastEmit = now;
-        controller.add(position);
+      if (now.difference(_lastPositionEmit) >=
+          const Duration(milliseconds: 500)) {
+        _lastPositionEmit = now;
+        _positionController.add(position);
       }
     });
-    return controller.stream;
+    return _positionController.stream;
   }();
+
+  /// 节流窗口起点：上次放行（或强制推送）位置事件的时刻。
+  DateTime _lastPositionEmit = DateTime.fromMillisecondsSinceEpoch(0);
 
   Stream<Duration> get playerPositionStream => _positionUi;
 
   Stream<Duration> get playerDurationStream => _player.durationStream;
+
+  /// 把位置立即推送到 UI 流并重置节流窗口（绕过节流）。
+  ///
+  /// 用途：seek 后播放器上报的位置事件可能落在节流窗口内被吞掉
+  /// （暂停时甚至不发射），若不强制推送会导致正文高亮与进度条滞后。
+  void _emitPosition(Duration position) {
+    _lastPositionEmit = DateTime.now();
+    _positionController.add(position);
+  }
 
   /// 加载持久化设置、打开数据库并恢复上次的书；启动时调用一次。
   Future<void> init() async {
     _settings = await _settingsStore.load();
     _audioStore.setRoot(_settings.outputRoot);
     _configureEngine();
-    // 打开数据库并恢复上次打开的书（章节状态与文件路径均在库中）。
+    // 打开数据库并恢复书架全部书籍与上次打开的书（章节状态与文件路径均在库中）。
     final database = _database;
     if (database != null) {
       try {
         await database.init();
+        _books = await database.loadBooks();
         final restored = await database.loadLatestBook();
         if (restored != null) {
           _book = restored;
-          _trackStatuses(restored);
         }
       } catch (_) {
         // 数据库不可用时降级为内存运行，不影响主流程。
@@ -139,9 +155,20 @@ class AppState extends ChangeNotifier {
     );
     _book = book;
     _playingIndex = -1;
-    _trackStatuses(book);
+    // 书架列表立即更新（新书置顶、同 id 覆盖去重），随后按数据库
+    // 导入时间序校正（同名覆盖时保持首次导入位置，跨会话顺序一致）。
+    _books = [book, ..._books.where((b) => b.id != book.id)];
     notifyListeners();
     unawaited(_persistBook(book));
+    unawaited(_refreshBooks());
+  }
+
+  /// 书架点击书籍：切换当前书（章节状态从数据库加载的实例），不重新导入。
+  void openBook(Book book) {
+    if (_book?.id == book.id) return;
+    _book = book;
+    _playingIndex = -1;
+    notifyListeners();
   }
 
   /// 保存并应用设置（重新装配引擎、切换输出根目录）。
@@ -181,22 +208,30 @@ class AppState extends ChangeNotifier {
     _syncBook();
   }
 
-  /// 跳转到指定章节并从该章重新生成（用于失败章节重试 / 手动跳章）。
+  /// 章节级重新生成：仅生成本章节（单章生成，不进入窗口循环、
+  /// 不涉及其他章节改动），用于失败章节重试。
   Future<void> regenerateChapter(int index) async {
-    await _engine.jumpTo(index);
+    await _engine.generateChapter(index);
     _syncBook();
   }
 
-  /// 继续生成：从第一个未完成章节（未生成/失败/已取消）开始，
-  /// 已生成章节自动跳过、不覆盖已有内容；全部已完成时返回 false。
-  Future<bool> continueGenerate() async {
+  /// 离线缓存入口：从最后一个已生成章节的下一章起整本生成（不受
+  /// 预加载窗口限制，窗口循环推进直到全部完成）。
+  ///
+  /// - 已有生成记录：从最后一个已生成章节之后继续（跳过已生成、
+  ///   不覆盖；其之前的失败/取消章节保持原状，可由章节卡片单独重试）；
+  /// - 无生成记录：从第 1 章开始整本生成；
+  /// - 全部章节均已生成：返回 false（调用方提示无需继续）。
+  Future<bool> generateOrContinue() async {
     final book = _book;
     if (book == null || !_settings.hasCredentials) return false;
-    var startIndex = 0;
-    while (startIndex < book.chapterCount &&
-        !book.chapterAt(startIndex).status.isRunnable) {
-      startIndex++;
+    var lastGenerated = -1;
+    for (var i = 0; i < book.chapterCount; i++) {
+      if (book.chapterAt(i).status == ChapterStatus.generated) {
+        lastGenerated = i;
+      }
     }
+    final startIndex = lastGenerated + 1; // 无记录时从 0 开始整本生成
     if (startIndex >= book.chapterCount) return false; // 全部完成
     if (!_engine.isConfigured) _configureEngine();
     await _engine.start(book, fromIndex: startIndex);
@@ -204,30 +239,21 @@ class AppState extends ChangeNotifier {
     return true;
   }
 
-  /// 从 [index] 章开始按当前配置重新生成：
-  /// 先将该章及之后章节的旧生成文件（音频/改写稿）转移到历史目录并更新
-  /// 快照路径，再重置章节状态，最后从该章重新调度生成。
+  /// 全部清空：删除本小说所有章节的已生成文件（音频/改写稿），重置全部
+  /// 章节状态为未生成（不触发生成），供「离线缓存」从头再来。
   ///
-  /// 文件转移失败会抛出异常（调用方负责提示），不继续生成避免覆盖丢失。
-  Future<void> regenerateFrom(int index) async {
+  /// 文件删除失败会抛出异常（调用方负责提示），不继续删除避免残留
+  /// 旧文件与状态不一致。
+  Future<void> clearAll() async {
     final book = _book;
     if (book == null) return;
-    index = index.clamp(0, book.chapterCount - 1);
 
     var updated = book;
-    for (var i = index; i < book.chapterCount; i++) {
+    for (var i = 0; i < book.chapterCount; i++) {
       final chapter = book.chapterAt(i);
-      final moved = await _audioStore.moveToHistory(
-        book.id,
-        i,
+      await _audioStore.deleteChapterFiles(
         audioPath: chapter.audioPath,
         rewritePath: chapter.rewritePath,
-      );
-      await _database?.updateSnapshotPaths(
-        book.id,
-        i,
-        audioPath: moved.audioPath,
-        rewritePath: moved.rewritePath,
       );
       updated = updated.replaceChapter(
         i,
@@ -241,39 +267,59 @@ class AppState extends ChangeNotifier {
       );
     }
     _book = updated;
-    _trackStatuses(updated);
     notifyListeners();
-
-    // 按最新配置从该章开始重新生成。
-    if (!_engine.isConfigured) _configureEngine();
-    await _engine.start(updated, fromIndex: index);
-    _syncBook();
+    await _persistBook(updated);
   }
 
-  /// 引擎状态流回调：更新内存书、整书落库、检测生成成功插入快照。
+  /// 删除小说：先停止可能进行中的生成（避免引擎回调把已删的书重新
+  /// 写回），清理该书全部已生成文件（章节记录的旧路径覆盖切换过
+  /// 根目录的历史文件 + 当前根目录的书目录），再移除数据库记录与
+  /// 书架项；删除的是当前书时同时复位。
+  ///
+  /// 文件删除失败抛异常（调用方负责提示），不继续删除避免残留；
+  /// 数据库删除失败静默（与落库失败策略一致，下次启动会恢复记录）。
+  Future<void> deleteBook(String id) async {
+    final candidates = _books.where((b) => b.id == id).toList();
+    if (candidates.isEmpty) return;
+    final book = candidates.first;
+    if (_engine.isConfigured) {
+      try {
+        await _engine.stop();
+      } catch (_) {
+        // 停止失败不阻塞删除（生成回调随后会被状态清理覆盖）。
+      }
+    }
+    for (var i = 0; i < book.chapterCount; i++) {
+      final chapter = book.chapterAt(i);
+      await _audioStore.deleteChapterFiles(
+        audioPath: chapter.audioPath,
+        rewritePath: chapter.rewritePath,
+      );
+    }
+    await _audioStore.deleteBookFiles(book.id);
+    final database = _database;
+    if (database != null) {
+      try {
+        await database.deleteBook(id);
+      } catch (_) {
+        // 数据库不可用时仍从内存移除，避免卡住书架操作。
+      }
+    }
+    _books = _books.where((b) => b.id != id).toList();
+    if (_book?.id == id) {
+      _book = null;
+      _playingIndex = -1;
+    }
+    notifyListeners();
+  }
+
+  /// 引擎状态流回调：更新内存书并整书落库。
   void _onBookChanged(Book book) {
     _book = book;
     notifyListeners();
     final database = _database;
     if (database == null) return;
     unawaited(_persistBook(book));
-    for (var i = 0; i < book.chapterCount; i++) {
-      final chapter = book.chapterAt(i);
-      final key = '${book.id}:$i';
-      final was = _seenStatus[key];
-      if (chapter.status == ChapterStatus.generated &&
-          was != ChapterStatus.generated) {
-        unawaited(database.insertSnapshot(
-          bookId: book.id,
-          chapterIndex: i,
-          status: chapter.status.name,
-          audioPath: chapter.audioPath,
-          rewritePath: chapter.rewritePath,
-          ttsConfigJson: _ttsConfigJson(),
-        ));
-      }
-      _seenStatus[key] = chapter.status;
-    }
   }
 
   /// 整书落库（书 + 章节状态），失败静默忽略（不阻塞 UI）。
@@ -285,13 +331,17 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  /// 当前 TTS 配置的 JSON 摘要（快照回溯用）。
-  String _ttsConfigJson() => jsonEncode({
-        'voice': _settings.voice,
-        'speed': _settings.speed,
-        'volume': _settings.volume,
-        'pitch': _settings.pitch,
-      });
+  /// 从数据库重载书架列表（导入后校正导入时间排序），失败时保留内存列表。
+  Future<void> _refreshBooks() async {
+    final database = _database;
+    if (database == null) return;
+    try {
+      _books = await database.loadBooks();
+      notifyListeners();
+    } catch (_) {
+      // 数据库不可用时保留内存列表。
+    }
+  }
 
   /// 把当前播放进度写入数据库（不触发 UI）。
   void _saveProgress() {
@@ -303,12 +353,6 @@ class AppState extends ChangeNotifier {
           .updateProgress(book.id, _playingIndex, _lastPosition)
           .catchError((_) {}),
     );
-  }
-
-  void _trackStatuses(Book book) {
-    for (var i = 0; i < book.chapterCount; i++) {
-      _seenStatus['${book.id}:$i'] = book.chapterAt(i).status;
-    }
   }
 
   /// 调度控制返回后同步引擎最新状态（广播流事件可能仍在派发中）。
@@ -327,6 +371,16 @@ class AppState extends ChangeNotifier {
       throw StateError('尚未导入书籍');
     }
     return _audioExporter.exportBook(book);
+  }
+
+  /// 聚合并导出：把全部已生成章节音频按顺序打包为不超过
+  /// [mergeFileSizeMb]（设置项，默认 100MB）的大文件，导出到所选目录。
+  Future<AudioMergeResult> mergeExportAudio() async {
+    final book = _book;
+    if (book == null) {
+      throw StateError('尚未导入书籍');
+    }
+    return _audioExporter.mergeBook(book, maxSizeMb: _settings.mergeFileSizeMb);
   }
 
   /// 播放指定章节音频。
@@ -388,7 +442,20 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  Future<void> seek(Duration position) => _player.seek(position);
+  /// 跳转播放位置：先把目标位置同步到 UI 流，再通知播放器 seek。
+  ///
+  /// 顺序上先推送 UI 再 await 播放器：拖动进度条时 UI 即时反馈，
+  /// 且播放器 seek 失败（底层引擎异常）不向上抛，避免拖动导致崩溃；
+  /// 播放中播放器后续位置事件会自然纠正偏差。
+  Future<void> seek(Duration position) async {
+    _lastPosition = position;
+    _emitPosition(position);
+    try {
+      await _player.seek(position);
+    } catch (_) {
+      // 播放器 seek 失败不影响应用运行（仅本次跳转未生效）。
+    }
+  }
 
   /// 自动连播：当前章播放完成后按章节顺序继续下一章。
   /// 下一章无音频时阻塞等待生成完成再播（复用 [playOrGenerate]，

@@ -47,36 +47,28 @@ class ChapterTile extends StatelessWidget {
         ),
       );
     } else if (status == ChapterStatus.failed) {
-      // 失败章节同时提供「重新生成并播放」与「仅重试」两个入口。
-      trailing = Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          IconButton(
-            tooltip: isPlaying ? '暂停' : '重新生成并播放',
-            onPressed: isPlaying ? onPause : onPlay,
-            icon: Icon(
-              isPlaying
-                  ? Icons.pause_circle_outline
-                  : Icons.play_circle_outline,
-              color: isCurrent ? theme.colorScheme.primary : null,
-            ),
-          ),
-          IconButton(
-            tooltip: '重试生成',
-            onPressed: onRetry,
-            icon: const Icon(Icons.refresh),
-          ),
-        ],
+      // 失败章节仅保留「重试生成」入口：章节级重新生成只生成本章节，
+      // 重试成功后状态转为已生成、自动切换为播放按钮，两者互斥不并存。
+      // ExcludeSemantics 规避 Flutter tooltip 语义嫁接框架 bug（#187198）：
+      // 悬浮/点击触发 AXTree 更新失败日志；提示与点击不受影响。
+      trailing = ExcludeSemantics(
+        child: IconButton(
+          tooltip: '重试生成',
+          onPressed: onRetry,
+          icon: const Icon(Icons.refresh),
+        ),
       );
     } else {
-      trailing = IconButton(
-        tooltip: isPlaying
-            ? '暂停'
-            : (status == ChapterStatus.generated ? '播放' : '生成并播放'),
-        onPressed: isPlaying ? onPause : onPlay,
-        icon: Icon(
-          isPlaying ? Icons.pause_circle_outline : Icons.play_circle_outline,
-          color: isCurrent ? theme.colorScheme.primary : null,
+      trailing = ExcludeSemantics(
+        child: IconButton(
+          tooltip: isPlaying
+              ? '暂停'
+              : (status == ChapterStatus.generated ? '播放' : '生成并播放'),
+          onPressed: isPlaying ? onPause : onPlay,
+          icon: Icon(
+            isPlaying ? Icons.pause_circle_outline : Icons.play_circle_outline,
+            color: isCurrent ? theme.colorScheme.primary : null,
+          ),
         ),
       );
     }

@@ -55,19 +55,44 @@ class _ReaderPanelState extends State<ReaderPanel> {
     if (widget.currentIndex != oldWidget.currentIndex &&
         widget.currentIndex >= 0 &&
         widget.currentIndex < widget.sentences.length) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted) return;
-        final ctx = _currentKey.currentContext;
-        if (ctx != null) {
-          Scrollable.ensureVisible(
-            ctx,
-            duration: const Duration(milliseconds: 240),
-            curve: Curves.easeOut,
-            alignment: 0.35,
-          );
-        }
-      });
+      WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToCurrent());
     }
+  }
+
+  /// 滚动跟随当前句。
+  ///
+  /// 当前句已构建（视口内，播放逐句前进场景）直接动画对齐；
+  /// 未构建（视口外，如拖动进度条大跨度跳转）时 ListView 懒加载
+  /// 尚未创建目标句，ensureVisible 无法生效，需先按索引比例跳转
+  /// 让目标句进入构建范围，下一帧再精确动画对齐。
+  void _scrollToCurrent() {
+    if (!mounted) return;
+    final ctx = _currentKey.currentContext;
+    if (ctx != null) {
+      Scrollable.ensureVisible(
+        ctx,
+        duration: const Duration(milliseconds: 240),
+        curve: Curves.easeOut,
+        alignment: 0.35,
+      );
+      return;
+    }
+    final position = _controller.position;
+    final ratio = widget.currentIndex / widget.sentences.length;
+    final target = ratio * position.maxScrollExtent;
+    _controller.jumpTo(target.clamp(0.0, position.maxScrollExtent));
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final ctx = _currentKey.currentContext;
+      if (ctx != null) {
+        Scrollable.ensureVisible(
+          ctx,
+          duration: const Duration(milliseconds: 240),
+          curve: Curves.easeOut,
+          alignment: 0.35,
+        );
+      }
+    });
   }
 
   @override
@@ -81,31 +106,36 @@ class _ReaderPanelState extends State<ReaderPanel> {
     final theme = Theme.of(context);
     final sentences = widget.sentences;
     final highlight = theme.colorScheme.primaryContainer;
-    return ListView.builder(
-      controller: _controller,
-      padding: widget.padding,
-      itemCount: sentences.length,
-      itemBuilder: (context, index) {
-        final isCurrent = index == widget.currentIndex;
-        return Container(
-          key: isCurrent ? _currentKey : null,
-          margin: const EdgeInsets.symmetric(vertical: 2),
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-          decoration: isCurrent
-              ? BoxDecoration(
-                  color: highlight.withValues(alpha: 0.45),
-                  borderRadius: BorderRadius.circular(8),
-                )
-              : null,
-          child: Text(
-            sentences[index],
-            style: theme.textTheme.bodyLarge?.copyWith(
-              height: 1.7,
-              fontWeight: isCurrent ? FontWeight.w600 : FontWeight.normal,
+    // 正文逐句列表对读屏无独立价值（朗读内容即音频本身）。排除语义可
+    // 避免自动滚动时 ListView 懒加载高频增删语义节点，触发 Windows
+    // accessibility_bridge 的「Nodes left pending by the update」错误日志。
+    return ExcludeSemantics(
+      child: ListView.builder(
+        controller: _controller,
+        padding: widget.padding,
+        itemCount: sentences.length,
+        itemBuilder: (context, index) {
+          final isCurrent = index == widget.currentIndex;
+          return Container(
+            key: isCurrent ? _currentKey : null,
+            margin: const EdgeInsets.symmetric(vertical: 2),
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: isCurrent
+                ? BoxDecoration(
+                    color: highlight.withValues(alpha: 0.45),
+                    borderRadius: BorderRadius.circular(8),
+                  )
+                : null,
+            child: Text(
+              sentences[index],
+              style: theme.textTheme.bodyLarge?.copyWith(
+                height: 1.7,
+                fontWeight: isCurrent ? FontWeight.w600 : FontWeight.normal,
+              ),
             ),
-          ),
-        );
-      },
+          );
+        },
+      ),
     );
   }
 }

@@ -5,12 +5,11 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 /// 生成文件落盘：把改写稿（中间文件）与合成音频（最终文件）写入
-/// 可配置的输出根目录，重新生成时把旧文件转移到历史子目录。
+/// 可配置的输出根目录，整本重新生成时删除旧文件后从头生成。
 ///
 /// 目录结构（[setRoot] 配置根目录，默认 `<appSupport>/generated`）：
 /// - `<root>/<bookId>/rewrite/<chapterIndex>.txt`   改写稿
 /// - `<root>/<bookId>/audio/<chapterIndex>.mp3`     合成音频
-/// - `<root>/<bookId>/history/<index>-<时间戳>.mp3`  重新生成时转移的旧文件
 /// bookId 中的非法路径字符会被替换为下划线。
 class AudioStore {
   AudioStore({Future<Directory> Function()? rootProvider})
@@ -66,38 +65,31 @@ class AudioStore {
     return file.path;
   }
 
-  /// 把章节的旧生成文件（音频/改写稿）转移到历史子目录，返回新的历史路径。
+  /// 删除章节的旧生成文件（音频/改写稿）——整本重新生成时清空旧产物。
   ///
-  /// 文件带时间戳命名，同一章多次重新生成互不覆盖；
-  /// 源文件不存在时对应历史路径返回 null。
-  Future<({String? audioPath, String? rewritePath})> moveToHistory(
-    String bookId,
-    int chapterIndex, {
+  /// 源文件不存在时静默跳过；删除失败抛异常（调用方负责提示），
+  /// 避免残留旧文件与新生成内容混用。
+  Future<void> deleteChapterFiles({
     String? audioPath,
     String? rewritePath,
   }) async {
-    final dir = Directory(p.join((await _bookDir(bookId)).path, 'history'));
-    await dir.create(recursive: true);
-    final stamp = _timestamp(DateTime.now());
-
-    String? newAudio;
     if (audioPath != null && await File(audioPath).exists()) {
-      newAudio = p.join(dir.path, '$chapterIndex-$stamp.mp3');
-      await File(audioPath).rename(newAudio);
+      await File(audioPath).delete();
     }
-    String? newRewrite;
     if (rewritePath != null && await File(rewritePath).exists()) {
-      newRewrite = p.join(dir.path, '$chapterIndex-$stamp.txt');
-      await File(rewritePath).rename(newRewrite);
+      await File(rewritePath).delete();
     }
-    return (audioPath: newAudio, rewritePath: newRewrite);
   }
 
-  /// 生成历史文件名时间戳（yyyyMMddHHmmss）。
-  static String _timestamp(DateTime t) {
-    String two(int v) => v.toString().padLeft(2, '0');
-    return '${t.year}${two(t.month)}${two(t.day)}'
-        '${two(t.hour)}${two(t.minute)}${two(t.second)}';
+  /// 删除整本书的生成目录（`<root>/<bookId>/`，含 audio 与 rewrite
+  /// 子目录），用于「删除小说」彻底清理。
+  ///
+  /// 目录不存在时静默跳过；删除失败抛异常（调用方负责提示）。
+  Future<void> deleteBookFiles(String bookId) async {
+    final dir = await _bookDir(bookId);
+    if (await dir.exists()) {
+      await dir.delete(recursive: true);
+    }
   }
 
   /// 替换 Windows 非法路径字符。
